@@ -11,9 +11,9 @@
 #
 # Requirements:
 #   • Cursor Agent CLI — https://cursor.com/install
-#   • CURSOR_API_KEY   — export in env, or ~/.config/heimdal_ai_analyze/env, or scripts/.env.hook (gitignored)
+#   • CURSOR_API_KEY   — export in env, or ~/.config/heimdal_ai_analyze/env, or repo .env / scripts/.env.hook (gitignored)
 #
-# Env file load order (later overrides earlier): user config → repo scripts/.env.hook
+# Env file load order (later overrides earlier): user config → repo .env → scripts/.env.hook
 #
 # Agent binary lookup (first match):
 #   1. $CURSOR_AGENT_BIN  2. scripts/.env.hook exports  3. git config cursorHook.agentPath
@@ -32,11 +32,13 @@ set -euo pipefail
 # │ Bootstrap                                                           │
 # └─────────────────────────────────────────────────────────────────────┘
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || REPO_ROOT=""
-# User-level config first (Heimdal gem); repo scripts/.env.hook overrides.
+# User-level config first (Heimdal gem); repo .env then scripts/.env.hook override.
 for f in "${XDG_CONFIG_HOME:+$XDG_CONFIG_HOME/heimdal_ai_analyze/env}" \
          "${HOME}/.config/heimdal_ai_analyze/env"; do
   [[ -n "$f" && -f "$f" ]] && { set -a; . "$f"; set +a; }
 done
+REPO_DOTENV="${REPO_ROOT:+$REPO_ROOT/.env}"
+[[ -n "$REPO_DOTENV" && -f "$REPO_DOTENV" ]] && { set -a; . "$REPO_DOTENV"; set +a; }
 ENV_HOOK="${REPO_ROOT:+$REPO_ROOT/scripts/.env.hook}"
 [[ -n "$ENV_HOOK" && -f "$ENV_HOOK" ]] && { set -a; . "$ENV_HOOK"; set +a; }
 
@@ -139,7 +141,7 @@ if [[ -z "${CURSOR_API_KEY:-}" ]]; then
   cat >&2 <<'MSG'
 pre-commit (analyze): CURSOR_API_KEY is required.
   → export CURSOR_API_KEY="…"
-  → Or ~/.config/heimdal_ai_analyze/env or scripts/.env.hook (see gem README / env.hook.example)
+  → Or ~/.config/heimdal_ai_analyze/env, .env, or scripts/.env.hook (see gem README / env.hook.example)
 MSG
   exit 1
 fi

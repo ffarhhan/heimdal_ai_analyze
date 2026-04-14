@@ -8,8 +8,8 @@ Gem::Specification.new do |spec|
   spec.authors = ["ffarhhan"]
   spec.email = ["ffarhhan@users.noreply.github.com"]
 
-  spec.summary = "Heimdal AI Analyze — Cursor Agent pre-commit gate for staged diffs"
-  spec.description = "Installs a git pre-commit hook that runs Cursor Agent on ANALYZE=true commits (e.g. git analyze). Requires CURSOR_API_KEY and the Cursor Agent CLI."
+  spec.summary = "Heimdal AI Analyze — git pre-commit hook for AI-assisted review of staged diffs (git analyze)"
+  spec.description = "Heimdal AI Analyze installs a git pre-commit hook that runs an AI-assisted code review of your staged diff when you commit with analysis enabled (e.g. `git analyze -m \"message\"`). Reviews security, duplication, complexity, style, and tests; critical issues can block the commit. Requires CURSOR_API_KEY in the environment or a repo-local `.env` (gitignored)."
   spec.homepage = "https://github.com/ffarhhan/heimdal_ai_analyze"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.1.0"

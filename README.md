@@ -1,19 +1,21 @@
 # Heimdal AI Analyze
 
-Ruby gem that installs a **git pre-commit** hook for **AI-assisted review** of your **staged diff** via the [Cursor Agent CLI](https://cursor.com/docs/cli/overview). The hook runs only when you commit with analysis enabled (e.g. `git analyze -m "message"`), not on normal commits.
+[![Gem Version](https://badge.fury.io/rb/heimdal_ai_analyze.svg)](https://rubygems.org/gems/heimdal_ai_analyze)
 
-## Requirements
+**Heimdal AI Analyze** is a Ruby gem that adds a **git pre-commit** hook for **AI-assisted review** of your **staged diff**. Use `git analyze` to run the review before your commit; a normal `git commit` does not trigger analysis unless you opt in.
 
-1. **Cursor Agent CLI** — install from [cursor.com/install](https://cursor.com/install) and ensure `agent` or `cursor-agent` is on your `PATH` (or set `CURSOR_AGENT_BIN`).
-2. **`CURSOR_API_KEY`** — export in your environment, or use a repo-local `scripts/.env.hook`, or `~/.config/heimdal_ai_analyze/env` (see below).
+_Sees every line. Judges every commit. No bad code crosses the Bifrost._
 
-## Install the gem
+- **RubyGems:** [rubygems.org/gems/heimdal_ai_analyze](https://rubygems.org/gems/heimdal_ai_analyze)
+- **Source:** [github.com/ffarhhan/heimdal_ai_analyze](https://github.com/ffarhhan/heimdal_ai_analyze)
+
+## Installation
 
 ```bash
 gem install heimdal_ai_analyze
 ```
 
-Or with Bundler:
+With Bundler:
 
 ```ruby
 # Gemfile
@@ -24,59 +26,45 @@ gem "heimdal_ai_analyze", group: :development
 bundle install
 ```
 
-## One-time setup per repository
+Requires **Ruby ≥ 3.1**.
 
-From the git repository root:
+## How it works
+
+1. **You run `git analyze -m "message"`** — A `git commit` alias that runs Heimdal’s review **before** your changes are committed.
+
+2. **Staged changes only** — Only files in the commit are analyzed; the rest of the tree is untouched.
+
+3. **Five dimensions** — **Security**, **duplication**, **complexity**, **style**, and **tests**.
+
+4. **Severity** — Issues are reported with location, explanation, and a suggested fix (**critical**, **warning**, **info**).
+
+**Result:** **Critical** findings **block** the commit until addressed. With no critical issues, the commit can proceed; lower severities are advisory.
+
+## One-time setup (per repository)
+
+Run from the repository root:
 
 ```bash
 bundle exec heimdal-ai-analyze-install
-# or, if the gem executable is on PATH:
+# or, if the executable is on your PATH:
 heimdal-ai-analyze-install
 ```
 
-This symlinks `.git/hooks/pre-commit` to the gem’s hook, sets `git analyze` alias (`ANALYZE=true git commit …`), records `heimdalAiAnalyze.gemPath`, and tries to save `cursorHook.agentPath` for the Cursor Agent binary.
+This links the gem’s pre-commit hook, registers the `git analyze` alias (`ANALYZE=true git commit …`), and stores the gem path in local git config. If an analysis binary is found, its path may be saved locally as well.
 
-## Credentials
+## API key
 
-**Minimum:** set an API key for the Cursor Agent:
+The hook needs **`CURSOR_API_KEY`** whenever you run `git analyze`.
 
-```bash
-export CURSOR_API_KEY="your-key"
-```
+- **This shell only:** `export CURSOR_API_KEY="…"` lasts for the current terminal session.
+- **Every session:** add that `export` to your shell profile (for example `~/.zshrc` or `~/.bashrc`), **or** keep the key in a **repository-root `.env`** file and add `.env` to `.gitignore` so it is never committed. The hook loads supported env files when it runs.
 
-Optional locations (loaded in order; later sources override earlier ones):
-
-1. `~/.config/heimdal_ai_analyze/env` or `$XDG_CONFIG_HOME/heimdal_ai_analyze/env` — `export CURSOR_API_KEY=...`
-2. `scripts/.env.hook` in the project (gitignored) — copy from `templates/env.hook.example` in this gem if you open the installed path under `$(gem env gemdir)`.
+For additional options and examples, see **`templates/env.hook.example`** inside the installed gem (`gem contents heimdal_ai_analyze` or `$(gem env gemdir)/gems/heimdal_ai_analyze-*`).
 
 ## Usage
 
 ```bash
-git analyze -m "Your commit message"   # runs AI review on staged changes, then commits if allowed
-git commit -m "message"                   # normal commit (hook skips AI unless ANALYZE=true)
-git commit --no-verify                    # bypass hooks when needed
-```
-
-## Development
-
-Clone [github.com/ffarhhan/heimdal_ai_analyze](https://github.com/ffarhhan/heimdal_ai_analyze):
-
-```bash
-git clone -o personal git@github.com:ffarhhan/heimdal_ai_analyze.git
-cd heimdal_ai_analyze
-gem build heimdal_ai_analyze.gemspec
-gem install ./heimdal_ai_analyze-*.gem --local
-```
-
-## Publish to RubyGems.org (maintainers)
-
-1. [Create an account](https://rubygems.org/sign_up) and enable MFA as required.
-2. `gem signin` with a [RubyGems API key](https://rubygems.org/profile/edit) (push scope).
-3. Bump `lib/heimdal_ai_analyze/version.rb`, then:
-
-```bash
-gem build heimdal_ai_analyze.gemspec
-gem push heimdal_ai_analyze-VERSION.gem
+git analyze -m "Your commit message"   # review staged changes, then commit if allowed
 ```
 
 ## License
