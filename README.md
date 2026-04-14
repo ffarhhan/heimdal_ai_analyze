@@ -1,5 +1,7 @@
 # Heimdal AI Analyze
 
+[![Repo views](https://komarev.com/ghpvc/?username=ffarhhan-heimdal-ai-analyze&label=Repo+views&style=for-the-badge)](https://github.com/ffarhhan/heimdal_ai_analyze)
+
 [![Gem Version](https://badge.fury.io/rb/heimdal_ai_analyze.svg)](https://rubygems.org/gems/heimdal_ai_analyze)
 
 **Heimdal AI Analyze** is a Ruby gem that adds a **git pre-commit** hook for **AI-assisted review** of your **staged diff**. Use `git analyze` to run the review before your commit; a normal `git commit` does not trigger analysis unless you opt in.
