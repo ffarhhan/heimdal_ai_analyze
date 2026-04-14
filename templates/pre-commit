@@ -1,0 +1,788 @@
+#!/usr/bin/env bash
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  Git Analyze — AI pre-commit code quality gate                      ║
+# ║  Runs via Cursor Agent CLI when ANALYZE=true                        ║
+# ║                                                                     ║
+# ║  Categories: DUPLICATION · COMPLEXITY · SECURITY · STYLE · TESTS    ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# Usage:   ANALYZE=true git commit -m "message"
+# Alias:   git analyze -m "message"  (if alias configured)
+#
+# Requirements:
+#   • Cursor Agent CLI — https://cursor.com/install
+#   • CURSOR_API_KEY   — export in env, or ~/.config/heimdal_ai_analyze/env, or scripts/.env.hook (gitignored)
+#
+# Env file load order (later overrides earlier): user config → repo scripts/.env.hook
+#
+# Agent binary lookup (first match):
+#   1. $CURSOR_AGENT_BIN  2. scripts/.env.hook exports  3. git config cursorHook.agentPath
+#   4. PATH: agent | cursor-agent  5. ~/.local/share/cursor-agent/versions/*/cursor-agent
+#
+# Env overrides:
+#   GIT_ANALYZE_AGENT_STYLE        chat-print (default) | chat-p | print-only
+#   GIT_ANALYZE_AGENT_EXTRA_ARGS   default: --trust
+#   GIT_ANALYZE_PROGRESS_FILL_SEC  progress bar fill target (default: 10)
+#   GIT_ANALYZE_FRAME_SLEEP        animation frame delay (default: 0.07)
+
+set -euo pipefail
+[[ "${ANALYZE:-}" == "true" ]] || exit 0
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Bootstrap                                                           │
+# └─────────────────────────────────────────────────────────────────────┘
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || REPO_ROOT=""
+# User-level config first (Heimdal gem); repo scripts/.env.hook overrides.
+for f in "${XDG_CONFIG_HOME:+$XDG_CONFIG_HOME/heimdal_ai_analyze/env}" \
+         "${HOME}/.config/heimdal_ai_analyze/env"; do
+  [[ -n "$f" && -f "$f" ]] && { set -a; . "$f"; set +a; }
+done
+ENV_HOOK="${REPO_ROOT:+$REPO_ROOT/scripts/.env.hook}"
+[[ -n "$ENV_HOOK" && -f "$ENV_HOOK" ]] && { set -a; . "$ENV_HOOK"; set +a; }
+
+AGENT_PID="" TMP_PROMPT="" TMP_OUT=""
+
+cleanup() {
+  local st=$?
+  if [[ -n "${AGENT_PID:-}" ]] && kill -0 "$AGENT_PID" 2>/dev/null; then
+    kill "$AGENT_PID" 2>/dev/null || true
+    wait "$AGENT_PID" 2>/dev/null || true
+  fi
+  rm -f "${TMP_PROMPT:-}" "${TMP_OUT:-}"
+  return "$st"
+}
+trap cleanup EXIT INT TERM
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Find Cursor Agent binary                                            │
+# └─────────────────────────────────────────────────────────────────────┘
+find_agent() {
+  local p
+  # Explicit paths
+  for p in "${CURSOR_AGENT_BIN:-}" "$(git config --get cursorHook.agentPath 2>/dev/null || true)"; do
+    [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  # PATH lookup
+  for name in agent cursor-agent; do
+    p=$(command -v "$name" 2>/dev/null || true)
+    [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  # Versioned install
+  local base="$HOME/.local/share/cursor-agent/versions"
+  if [[ -d "$base" ]]; then
+    p=$(find "$base" -name cursor-agent -type f 2>/dev/null | LC_ALL=C sort | tail -1)
+    [[ -n "$p" && -x "$p" ]] && { printf '%s' "$p"; return 0; }
+  fi
+  return 1
+}
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Spec-coverage hints (injected into TESTS section of prompt)         │
+# └─────────────────────────────────────────────────────────────────────┘
+spec_guess() {
+  local f=$1
+  case "$f" in
+    app/models/*.rb)      echo "spec/models/${f#app/models/}"      | sed 's/\.rb$/_spec.rb/' ;;
+    app/services/*.rb)    echo "spec/services/${f#app/services/}"  | sed 's/\.rb$/_spec.rb/' ;;
+    app/workers/*.rb)     echo "spec/workers/${f#app/workers/}"    | sed 's/\.rb$/_spec.rb/' ;;
+    app/controllers/*.rb) echo "spec/requests/${f#app/controllers/}" | sed 's/\.rb$/_spec.rb/' ;;
+    lib/*.rb)             echo "spec/lib/${f#lib/}"                | sed 's/\.rb$/_spec.rb/' ;;
+    *)                    echo "spec/**/*" ;;
+  esac
+}
+
+build_coverage_hint() {
+  local staged_specs f guess
+  staged_specs=$(git -C "${REPO_ROOT:-.}" diff --cached --name-only --diff-filter=ACM 2>/dev/null \
+    | grep -E '^spec/.+_spec\.rb$' | sort -u || true)
+
+  if [[ -z "$staged_specs" ]]; then
+    printf 'Staged spec files: <none>\n'
+  else
+    printf 'Staged spec files:\n'
+    printf '%s\n' "$staged_specs" | sed 's/^/  • /'
+  fi
+
+  printf '\nProduction files → expected spec:\n'
+
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ "$f" =~ \.rb$ && "$f" =~ ^(app|lib)/ ]] || continue
+    [[ "$f" =~ ^app/(assets|javascript|views|helpers|mailers|jobs)/ ]] && continue
+    guess=$(spec_guess "$f")
+    if [[ "$guess" == *'*'* ]]; then
+      printf '• %s → %s\n' "$f" "$guess"
+    elif printf '%s\n' "$staged_specs" | grep -qFx "$guess" 2>/dev/null; then
+      printf '• %s → %s [STAGED ✓]\n' "$f" "$guess"
+    else
+      printf '• %s → %s [NOT STAGED]\n' "$f" "$guess"
+    fi
+  done < <(git -C "${REPO_ROOT:-.}" diff --cached --name-only --diff-filter=ACM 2>/dev/null | sort -u)
+}
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Prerequisites                                                       │
+# └─────────────────────────────────────────────────────────────────────┘
+DIFF=$(git diff --cached || true)
+if [[ -z "$DIFF" ]]; then
+  echo "pre-commit (analyze): no staged changes; skipping." >&2
+  exit 0
+fi
+
+MAX_CHARS=60000
+if (( ${#DIFF} > MAX_CHARS )); then
+  DIFF="${DIFF:0:$MAX_CHARS}
+[TRUNCATED at $MAX_CHARS chars — diff was ${#DIFF} characters]"
+fi
+
+if [[ -z "${CURSOR_API_KEY:-}" ]]; then
+  cat >&2 <<'MSG'
+pre-commit (analyze): CURSOR_API_KEY is required.
+  → export CURSOR_API_KEY="…"
+  → Or ~/.config/heimdal_ai_analyze/env or scripts/.env.hook (see gem README / env.hook.example)
+MSG
+  exit 1
+fi
+export CURSOR_API_KEY
+
+AGENT_BIN=$(find_agent) || {
+  cat >&2 <<'MSG'
+pre-commit (analyze): Cursor Agent CLI not found.
+  → Install:  curl https://cursor.com/install -fsSL | bash
+  → Ensure ~/.local/bin is on PATH (or set CURSOR_AGENT_BIN).
+MSG
+  exit 1
+}
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ PROMPT — 4 categories + TESTS, single source of truth              │
+# └─────────────────────────────────────────────────────────────────────┘
+read -r -d '' PROMPT <<'PROMPT_EOF' || true
+Role: Senior Ruby on Rails code reviewer. Review ONLY the staged diff below.
+
+## HARD RULES
+- Analyze ONLY added/changed lines (`+` prefix). Lines with `-` or ` ` are context only.
+- Every finding MUST cite a real file path and line number from the diff `@@ … @@` headers. Never invent paths or lines not present in the diff.
+- Do NOT flag: deleted code, test files (unless security risk), schema.rb, or auto-generated files.
+- Migrations: flag ONLY for security or data-safety risks (table locks, missing rollback, column removal without ignored_columns).
+- Prefer ZERO false positives over completeness — when uncertain, skip the finding.
+- Do NOT report the same issue under multiple categories.
+- Maximum 15 findings. Prioritize by severity.
+
+───────────────────────────────────────
+
+## CATEGORY 1 — SECURITY
+The only category that can produce CRITICAL findings.
+
+CRITICAL (blocks commit):
+- SQL injection: string interpolation in raw SQL — `where("col = '#{v}'")`, `execute("…#{v}…")`. Safe: `where(col: v)`, `where("col = ?", v)`, Arel, `sanitize_sql`.
+- Mass assignment: `params.permit!`; `update(params)`/`create(params)` without strong params; `.permit` exposing sensitive columns (role, admin, is_superadmin, password_digest, email_verified).
+- Hardcoded secrets: API keys, passwords, tokens, private keys as string literals in source. Safe: `Rails.application.credentials`, `ENV.fetch`, `ENV[]`, encrypted credentials.
+- Missing auth/authz: new controller action without `before_action :authenticate_*` or Pundit/CanCan policy when sibling actions enforce them.
+- Unsafe redirect: `redirect_to params[:url]` / `params[:return_to]` without allow-list.
+- Unsafe deserialization: `Marshal.load`, `YAML.unsafe_load`, `constantize`/`safe_constantize` on user input.
+- Unsafe migration: `add_index` on large table without `algorithm: :concurrently` (PG write-lock); removing/renaming column without `ignored_columns` (rolling-deploy crash); `change_column` type change on populated table; irreversible `execute` DDL without `down`/`reversible`.
+- Race condition with data-loss risk: read-then-write without DB lock/unique constraint on financial data — balance increment without `with_lock`/`update_counters`; check-then-create without unique index; double-submit without idempotency key.
+
+WARNING:
+- `skip_forgery_protection` without API-only justification.
+- `send`/`public_send`/`constantize` on user-controlled input.
+- `File.read(params[…])` / `send_file(params[…])` — path traversal.
+- Logging unfiltered `params` or explicitly logging tokens/passwords.
+- `rescue` silently swallowing exceptions in payment/billing/financial path.
+- Missing `null: false` on column validated `presence: true` (DB/app disagree).
+- Missing foreign key or index on `belongs_to` reference column.
+
+───────────────────────────────────────
+
+## CATEGORY 2 — DUPLICATION
+DRY violations, repeated logic, N+1 queries, thin controllers.
+
+WARNING:
+- Repeated code blocks: ≥5 structurally identical lines differing only by variable/column names → extract method, concern, or service.
+- N+1 queries: iterating a collection and calling `.association`, `Model.find`, or `Model.where` inside the loop without prior `includes`/`preload`/`eager_load` → add eager loading.
+- Copy-pasted queries: same where-chains/scopes/joins duplicated across controllers or services → extract to named scope or query object.
+- Controller responsibility: identical before_action, param-parsing, or response-building repeated across actions → extract concern or shared method.
+
+INFO:
+- Near-duplicate logic (same shape, different domain) that could share an abstraction.
+- Same guard condition repeated in 3+ methods → extract predicate method.
+
+───────────────────────────────────────
+
+## CATEGORY 3 — COMPLEXITY
+Long methods, deep nesting, SRP violations, error handling, robustness.
+
+WARNING:
+- Long methods: >20 added lines in a single `def…end` → extract private method or service.
+- Deep nesting: >3 levels (if inside each inside if inside begin) → guard clause, early return, extract method.
+- Fat controllers: >10 lines of business logic beyond CRUD → service object or form object.
+- God model: model receiving >5 unrelated public methods in this diff → concern or service.
+- Callback chains: >3 `before_*`/`after_*` callbacks forming orchestration → explicit service.
+- Bare rescue / `rescue Exception`: catches `SignalException`/`SystemExit` → use `rescue StandardError`.
+- Swallowed exceptions: empty rescue or `rescue => e` with no logging/re-raise → add logging + re-raise or meaningful fallback.
+- External call without error handling: HTTP client (`Net::HTTP`, `Faraday`, `HTTParty`, `RestClient`) without rescue for timeout/connection errors → wrap with rescue + fallback.
+- Retry without limit: `retry` with no counter → add `attempts < MAX` guard.
+- Unbounded query: `Model.all` or `.where(…)` without `.limit()` in controller/API → add pagination.
+- Missing `find_each`: `.each` on large scope loads everything into memory → use `.find_each`.
+- Non-atomic writes: multiple `save!`/`update!` without `transaction {}` → wrap in transaction.
+- `update_column`/`update_all` bypassing validations on critical fields → use `update!` or add guards.
+
+INFO:
+- Long parameter lists (>4 params) → keyword args or value object.
+- Method with >3 responsibilities → split pipeline.
+- Single-line `rescue nil` modifier — hides failures.
+- Synchronous HTTP in request cycle without timeout → background job or `timeout:`.
+- `.count`/`.size` inside loop on loaded association → `.length` or `counter_cache`.
+- Missing `ensure` for resource cleanup.
+
+───────────────────────────────────────
+
+## CATEGORY 4 — STYLE
+Idiomatic Ruby/Rails, naming, dead code. Always INFO — never CRITICAL or WARNING.
+
+INFO only:
+- `if !x` → `unless x`; `x == nil` → `x.nil?`; manual loop → `map`/`select`/`each_with_object`; unnecessary `self.`; `lambda { }` → `-> { }`.
+- `Model.all.map { |r| r.col }` → `.pluck(:col)`.
+- Opaque names (`x`, `tmp`, `data`, `obj`, `res`) → descriptive. Don't nitpick `id`, `url`, `params`.
+- Dead code: defined method never called in diff and not public API.
+- `default_scope` — almost always wrong.
+- `after_save` with side effects → `after_commit` (avoids job running before commit).
+- Mixing `Hash#[]` / `Hash#fetch` inconsistently.
+- `present?`/`blank?` where `nil?` suffices.
+- Missing `dependent: :destroy`/`:nullify` on `has_many`/`has_one` → orphan records.
+- Missing `counter_cache: true` when parent frequently calls `.count`.
+
+───────────────────────────────────────
+
+## CATEGORY 5 — TESTS
+Staged spec coverage. Uses the hook hint injected below.
+
+WARNING:
+- Production behavior changed (new branch, validation, auth, external call, error path, state transition) but matching spec NOT staged and no other staged spec covers it.
+- New public endpoint or service method with no plausible spec staged.
+
+INFO:
+- Spec staged but diff adds branch/edge case the spec likely doesn't hit.
+
+SKIP (do NOT flag): comment-only edits, renames, config churn, `[STAGED ✓]` in hint.
+
+───────────────────────────────────────
+
+## SEVERITY LADDER
+
+| Level    | Blocks commit? | Where used                                                          |
+|----------|:-:|-----------------------------------------------------------------------------|
+| CRITICAL | ✅ | SECURITY only: SQLi, mass assignment, secrets, missing auth, unsafe migration, race condition, unsafe deserialization, unsafe redirect |
+| WARNING  | ❌ | SECURITY (CSRF, logging, missing constraints) · DUPLICATION (N+1, DRY) · COMPLEXITY (long methods, bare rescue, unbounded query, non-atomic) · TESTS (missing spec) |
+| INFO     | ❌ | STYLE (always) · minor DUPLICATION / COMPLEXITY / TESTS findings            |
+
+───────────────────────────────────────
+
+## OUTPUT FORMAT (follow exactly)
+
+### Zero issues → single line:
+NO_ISSUES_FOUND
+
+### One or more issues:
+
+Line 1 (mandatory):
+SUMMARY: X critical, Y warnings, Z info
+
+Then findings in severity order — all CRITICAL first, then WARNING, then INFO:
+
+#### CRITICAL (full block per finding, blank line between):
+
+[CRITICAL] path/to/file.rb:LINE - CATEGORY: one-line description
+LOCATION: path/to/file.rb:LINE
+SUGGESTED_FIX: Imperative sentence.
+
+```ruby before
+# minimal excerpt of problematic code from the diff
+```
+
+```ruby recommended
+# paste-ready fixed version
+```
+
+(Omit `before` fence if code is entirely new.)
+
+#### WARNING (one line each):
+[WARNING] path/to/file.rb:LINE - CATEGORY: short description
+
+#### INFO (one line each):
+[INFO] path/to/file.rb:LINE - CATEGORY: short description
+
+CATEGORY must be exactly: DUPLICATION | COMPLEXITY | SECURITY | STYLE | TESTS
+
+No prose before SUMMARY. No closing section after the last finding. Stop immediately.
+
+───────────────────────────────────────
+
+## EXAMPLE
+
+SUMMARY: 1 critical, 3 warnings, 2 info
+
+[CRITICAL] app/controllers/users_controller.rb:42 - SECURITY: SQL injection via string interpolation in where clause
+LOCATION: app/controllers/users_controller.rb:42
+SUGGESTED_FIX: Use parameterized hash condition instead of string interpolation.
+
+```ruby before
+User.where("email = '#{params[:email]}'")
+```
+
+```ruby recommended
+User.where(email: params[:email])
+```
+
+[WARNING] app/services/billing_service.rb:18 - DUPLICATION: charge calculation duplicated at lines 18 and 45; extract private method
+[WARNING] app/services/sync_service.rb:33 - COMPLEXITY: bare rescue catches SignalException and SystemExit; use rescue StandardError
+[WARNING] app/models/order.rb:72 - TESTS: new fulfill! state transition but spec/models/order_spec.rb not staged
+[INFO] app/controllers/api/v1/products_controller.rb:12 - STYLE: if !product.active? is more idiomatic as unless product.active?
+[INFO] app/models/user.rb:55 - COMPLEXITY: .each on User.where(active: true) without find_each; may load entire table
+
+___GIT_ANALYZE_HOOK_HINT___
+
+--- BEGIN DIFF ---
+PROMPT_EOF
+
+# ── Inject hints + diff ──────────────────────────────────────────────
+COVERAGE_HINT=$(build_coverage_hint)
+PROMPT="${PROMPT/___GIT_ANALYZE_HOOK_HINT___/$COVERAGE_HINT}"
+PROMPT+=$'\n'"$DIFF"$'\n'"--- END DIFF ---"
+
+TMP_PROMPT=$(mktemp "${TMPDIR:-/tmp}/analyze-prompt.XXXXXX")
+TMP_OUT=$(mktemp "${TMPDIR:-/tmp}/analyze-out.XXXXXX")
+printf '%s' "$PROMPT" > "$TMP_PROMPT"
+
+ESCAPED_PROMPT=$(ruby -e 'require "json"; print JSON.generate(File.read(ARGV[0]))' "$TMP_PROMPT")
+PROMPT_SHELL_Q=$(printf '%q' "$ESCAPED_PROMPT")
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Terminal Colors & Layout                                            │
+# └─────────────────────────────────────────────────────────────────────┘
+HAS_COLOR=0
+[[ -t 1 || -t 2 ]] && HAS_COLOR=1
+
+if (( HAS_COLOR )); then
+  # ── Core ──
+  RST=$'\e[0m'  BOLD=$'\e[1m'  DIM=$'\e[2m'  ITALIC=$'\e[3m'  ULINE=$'\e[4m'
+  # ── Foreground ──
+  RED=$'\e[31m'     REDB=$'\e[1;31m'   # findings: CRITICAL
+  GRN=$'\e[32m'     GRNB=$'\e[1;32m'   # recommended code, pass verdict
+  YEL=$'\e[33m'     YELB=$'\e[1;33m'   # findings: WARNING
+  BLU=$'\e[34m'     BLUB=$'\e[1;34m'   # findings: INFO, LOCATION
+  MAG=$'\e[35m'     MAGB=$'\e[1;35m'   # SUMMARY line
+  CYN=$'\e[36m'     CYNB=$'\e[1;36m'   # accents, SUGGESTED_FIX
+  WHT=$'\e[37m'     WHTB=$'\e[1;37m'   # headings
+  # ── Background accents (subtle) ──
+  BG_RED=$'\e[41m'  BG_GRN=$'\e[42m'  BG_BLU=$'\e[44m'  BG_YEL=$'\e[43m'
+else
+  RST='' BOLD='' DIM='' ITALIC='' ULINE=''
+  RED='' REDB='' GRN='' GRNB='' YEL='' YELB=''
+  BLU='' BLUB='' MAG='' MAGB='' CYN='' CYNB=''
+  WHT='' WHTB='' BG_RED='' BG_GRN='' BG_BLU='' BG_YEL=''
+fi
+
+# Terminal width (capped 50–100)
+COLS=$(tput cols 2>/dev/null || echo 80)
+[[ "$COLS" =~ ^[0-9]+$ ]] || COLS=80
+(( COLS < 50 )) && COLS=80
+(( COLS > 100 )) && COLS=100
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Display Helpers                                                     │
+# └─────────────────────────────────────────────────────────────────────┘
+
+# Repeat a character N times
+repeat_char() { printf '%*s' "$2" '' | tr ' ' "$1"; }
+
+# Full-width rule with optional character
+rule() { printf '%s%s%s\n' "$DIM" "$(repeat_char "${1:-─}" "$COLS")" "$RST"; }
+
+# Double-line decorative banner
+banner() {
+  local title=$1 subtitle=${2:-}
+  local pad_t=$(( (COLS - ${#title}) / 2 ))
+  local pad_s=$(( (COLS - ${#subtitle}) / 2 ))
+  (( pad_t < 0 )) && pad_t=0
+  (( pad_s < 0 )) && pad_s=0
+
+  printf '\n'
+  printf '%s%s%s\n' "$DIM" "$(repeat_char '═' "$COLS")" "$RST"
+  printf '%*s%s%s%s\n' "$pad_t" '' "$WHTB" "$title" "$RST"
+  [[ -n "$subtitle" ]] && \
+    printf '%*s%s%s%s\n' "$pad_s" '' "${DIM}${CYN}" "$subtitle" "$RST"
+  printf '%s%s%s\n' "$DIM" "$(repeat_char '═' "$COLS")" "$RST"
+}
+
+# Centered title between dashes:  ──── Title ────
+hr_title() {
+  local title=$1
+  local tlen=${#title}
+  local avail=$(( COLS - tlen - 4 ))
+  (( avail < 8 )) && avail=8
+  local left=$(( avail / 2 ))
+  local right=$(( avail - left ))
+  printf '%s%s%s  %s%s%s  %s%s%s\n' \
+    "$DIM" "$(repeat_char '─' "$left")" "$RST" \
+    "$BOLD" "$title" "$RST" \
+    "$DIM" "$(repeat_char '─' "$right")" "$RST"
+}
+
+# Right-aligned label after dashes:  ────────── Label
+hr_right() {
+  local label=$1
+  local dashes=$(( COLS - ${#label} - 2 ))
+  (( dashes < 12 )) && dashes=12
+  printf '%s%s%s  %s%s\n' "$DIM" "$(repeat_char '─' "$dashes")" "$RST" "$label" "$RST"
+}
+
+# Word-wrap text with color, 2-space indent (first line), 6-space (continuation)
+wrap() {
+  local text=$1 color=${2:-$RST} width=$(( COLS - 6 )) ln n=0
+  (( width < 52 )) && width=52
+  while IFS= read -r ln || [[ -n "$ln" ]]; do
+    [[ -z "${ln//[[:space:]]/}" ]] && continue
+    if (( n == 0 )); then
+      printf '  %s%s%s\n' "$color" "$ln" "$RST"
+    else
+      printf '      %s%s%s\n' "$color" "$ln" "$RST"
+    fi
+    n=$((n + 1))
+  done < <(fold -s -w "$width" <<< "$text" 2>/dev/null || printf '%s\n' "$text")
+}
+
+# Trim leading/trailing whitespace
+trim() {
+  local s=$1
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Labeled badge:  ▸ LABEL
+badge() { printf '  %s▸%s %s%s%s' "$CYNB" "$RST" "$BOLD" "$1" "$RST"; }
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Pre-flight display                                                  │
+# └─────────────────────────────────────────────────────────────────────┘
+FILE_COUNT=$(git diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+FILE_STAT=$(git diff --cached --shortstat 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+FILE_NAMES=$(git diff --cached --name-only 2>/dev/null | head -6)
+FILE_REMAIN=$(( FILE_COUNT - 6 ))
+
+{
+  banner "Git Analyze · AI Code Quality Gate" \
+         "Cursor Agent · single-pass staged diff review"
+  printf '\n'
+
+  # ── Staged scope ──
+  badge "Staged Scope"
+  printf '\n'
+  printf '    %s%s%s file(s)' "$BOLD" "$FILE_COUNT" "$RST"
+  [[ -n "$FILE_STAT" ]] && printf '  %s(%s)%s' "$DIM" "$FILE_STAT" "$RST"
+  printf '\n'
+  while IFS= read -r fn; do
+    [[ -z "$fn" ]] && continue
+    # Color by file type
+    if [[ "$fn" == app/controllers/* ]]; then   printf '    %s●%s %s\n' "$CYN"  "$RST" "$fn"
+    elif [[ "$fn" == app/models/* ]]; then       printf '    %s●%s %s\n' "$MAG"  "$RST" "$fn"
+    elif [[ "$fn" == app/services/* ]]; then     printf '    %s●%s %s\n' "$GRN"  "$RST" "$fn"
+    elif [[ "$fn" == spec/* ]]; then             printf '    %s●%s %s\n' "$YEL"  "$RST" "$fn"
+    elif [[ "$fn" == db/migrate/* ]]; then       printf '    %s●%s %s\n' "$RED"  "$RST" "$fn"
+    else                                         printf '    %s●%s %s\n' "$DIM"  "$RST" "$fn"
+    fi
+  done <<< "$FILE_NAMES"
+  (( FILE_REMAIN > 0 )) && printf '    %s… and %d more file(s)%s\n' "$DIM" "$FILE_REMAIN" "$RST"
+  printf '\n'
+
+  # ── Review dimensions ──
+  badge "Review Dimensions"
+  printf '  %s%s\n' "$DIM" "$RST"
+  printf '\n'
+  printf '    %s┌──────────────────────────────────────────────────┐%s\n' "$DIM" "$RST"
+  printf '    %s│%s  %s 1 %s  %-11s %s│%s  %s\n' "$DIM" "$RST" "${BG_BLU}${WHTB}" "$RST" "DUPLICATION" "$DIM" "$RST" "DRY · repeated logic · N+1 · thin controllers"
+  printf '    %s│%s  %s 2 %s  %-11s %s│%s  %s\n' "$DIM" "$RST" "${BG_BLU}${WHTB}" "$RST" "COMPLEXITY"  "$DIM" "$RST" "long methods · nesting · god objects · SRP"
+  printf '    %s│%s  %s 3 %s  %-11s %s│%s  %s\n' "$DIM" "$RST" "${BG_RED}${WHTB}" "$RST" "SECURITY"    "$DIM" "$RST" "SQLi · mass assignment · secrets · auth/authz"
+  printf '    %s│%s  %s 4 %s  %-11s %s│%s  %s\n' "$DIM" "$RST" "${BG_BLU}${WHTB}" "$RST" "STYLE"       "$DIM" "$RST" "idiomatic Rails/Ruby · naming · dead code"
+  printf '    %s│%s  %s + %s  %-11s %s│%s  %s\n' "$DIM" "$RST" "${BG_GRN}${WHTB}" "$RST" "TESTS"       "$DIM" "$RST" "staged spec coverage for changed behavior"
+  printf '    %s└──────────────────────────────────────────────────┘%s\n' "$DIM" "$RST"
+  printf '\n'
+
+  hr_right "Running analysis…"
+  printf '\n'
+} >&2
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Run Agent                                                           │
+# └─────────────────────────────────────────────────────────────────────┘
+run_agent() {
+  local style="${GIT_ANALYZE_AGENT_STYLE:-chat-print}"
+  local extra="${GIT_ANALYZE_AGENT_EXTRA_ARGS:---trust}"
+  # shellcheck disable=SC2086
+  case "$style" in
+    chat-p)     eval "\"$AGENT_BIN\" $extra chat -p $PROMPT_SHELL_Q"      </dev/null ;;
+    print-only) eval "\"$AGENT_BIN\" $extra --print $PROMPT_SHELL_Q"      </dev/null ;;
+    *)          eval "\"$AGENT_BIN\" $extra chat --print $PROMPT_SHELL_Q"  </dev/null ;;
+  esac
+}
+( run_agent >"$TMP_OUT" 2>&1 ) &
+AGENT_PID=$!
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Progress Bar                                                        │
+# └─────────────────────────────────────────────────────────────────────┘
+BAR_W=44
+SPIN_CHARS=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+# Fallback to ASCII if terminal can't render braille
+printf '%s' "${SPIN_CHARS[0]}" >/dev/null 2>&1 || SPIN_CHARS=('|' '/' '-' '\')
+SPIN_LEN=${#SPIN_CHARS[@]}
+
+FILL_SEC=${GIT_ANALYZE_PROGRESS_FILL_SEC:-10}
+FSLEEP=${GIT_ANALYZE_FRAME_SLEEP:-0.07}
+FSLEEP_MS=$(awk -v s="$FSLEEP" 'BEGIN{x=int(s*1000+.5); print (x<1?1:x)}' 2>/dev/null || echo 70)
+MIN_FR=$(( (2000 + FSLEEP_MS - 1) / FSLEEP_MS ))
+(( MIN_FR < 12 )) && MIN_FR=12
+MAX_FR=$(( (FILL_SEC * 1000 + FSLEEP_MS - 1) / FSLEEP_MS ))
+(( MAX_FR < 30 )) && MAX_FR=30
+
+draw_bar() {
+  local pct=$1 spin_ch=${2:-}
+  local filled=$(( pct * BAR_W / 100 )) empty
+  (( filled > BAR_W )) && filled=$BAR_W
+  (( pct > 0 && filled == 0 )) && filled=1
+  empty=$(( BAR_W - filled ))
+
+  # Build bar segments
+  local bar_fill bar_empty
+  bar_fill=$(repeat_char '█' "$filled")
+  bar_empty=$(repeat_char '░' "$empty")
+
+  # Color the percentage based on progress
+  local pct_color=$DIM
+  (( pct >= 30 )) && pct_color=$CYN
+  (( pct >= 60 )) && pct_color=$CYNB
+  (( pct >= 90 )) && pct_color=$GRNB
+
+  printf '\e[2K\r  %s%s%s%s%s %s%3d%%%s' \
+    "$CYNB" "$bar_fill" "$DIM" "$bar_empty" "$RST" \
+    "$pct_color" "$pct" "$RST" >&2
+  if [[ -n "$spin_ch" ]]; then
+    printf '  %s%s%s' "$CYNB" "$spin_ch" "$RST" >&2
+  fi
+}
+
+draw_complete() {
+  local bar_full
+  bar_full=$(repeat_char '█' "$BAR_W")
+  printf '\e[2K\r  %s%s%s %s100%% %s ✓ Analysis complete%s\n' \
+    "$GRNB" "$bar_full" "$RST" "$GRNB" "$GRNB" "$RST" >&2
+}
+
+if [[ -t 2 ]]; then
+  frame=0 reaped=0 pct=0
+  while true; do
+    frame=$((frame + 1))
+    si=$(( frame % SPIN_LEN ))
+
+    # Check if agent finished
+    if (( !reaped )) && ! kill -0 "$AGENT_PID" 2>/dev/null; then
+      wait "$AGENT_PID" || true
+      reaped=1; AGENT_PID=""
+    fi
+
+    # Calculate percentage
+    if (( !reaped )); then
+      if (( frame < MAX_FR )); then pct=$(( frame * 90 / MAX_FR ))
+      else pct=$(( 90 + (frame - MAX_FR) / 28 )); fi
+    else
+      pct=$(( frame * 92 / MIN_FR ))
+      (( pct > 92 )) && pct=92
+    fi
+    (( pct > 94 )) && pct=94
+
+    draw_bar "$pct" "${SPIN_CHARS[$si]}"
+    sleep "$FSLEEP"
+    (( reaped && frame >= MIN_FR )) && break
+  done
+
+  for endpct in 96 98 100; do draw_bar "$endpct" ""; sleep 0.04; done
+  draw_complete
+else
+  printf '%s  ⏳ No TTY — waiting for Cursor Agent…%s\n' "$DIM" "$RST" >&2
+  wait "$AGENT_PID" || true
+  AGENT_PID=""
+fi
+
+# Ensure no zombie
+[[ -n "${AGENT_PID:-}" ]] && { wait "$AGENT_PID" || true; AGENT_PID=""; }
+
+RAW=$(cat "$TMP_OUT" || true)
+if [[ -z "$RAW" ]]; then
+  printf '\n  %s✗ Cursor Agent produced no output (check CLI, API key, network). Failing closed.%s\n' "$REDB" "$RST" >&2
+  exit 1
+fi
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Render findings                                                     │
+# └─────────────────────────────────────────────────────────────────────┘
+colorize_line() {
+  local orig line
+  orig=$(trim "$1")
+  [[ -z "$orig" ]] && { printf '\n'; return 0; }
+  line="${orig//\*\*/}"
+  line=$(trim "$line")
+
+  if [[ "$line" == SUMMARY:* ]]; then
+    printf '\n'
+    printf '  %s%s ▸ %s%s\n' "$MAGB" "$BOLD" "$line" "$RST"
+    printf '\n'
+  elif [[ "$line" == *"[CRITICAL]"* ]]; then
+    printf '  %s%s⬤  %s%s\n' "$REDB" "$BOLD" "$orig" "$RST"
+  elif [[ "$line" == *"[WARNING]"* ]]; then
+    printf '  %s◉  %s%s\n' "$YELB" "$orig" "$RST"
+  elif [[ "$line" == *"[INFO]"* ]]; then
+    printf '  %s○  %s%s\n' "$BLUB" "$orig" "$RST"
+  elif [[ "$line" == LOCATION:* ]]; then
+    printf '     %s↳ %s%s\n' "$BLU" "${line#LOCATION: }" "$RST"
+  elif [[ "$line" == SUGGESTED_FIX:* ]]; then
+    printf '     %s💡 %s%s\n' "$CYNB" "${line#SUGGESTED_FIX: }" "$RST"
+  else
+    wrap "$orig" "$DIM"
+  fi
+}
+
+render_findings() {
+  local line t tl fence="" skip_rec=0 nocolor low
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    (( skip_rec )) && continue
+
+    t=$(trim "$line")
+    t="${t//$'\r'/}"
+    nocolor="${t//\*\*/}"
+    nocolor=$(trim "$nocolor")
+    low=$(printf '%s' "$nocolor" | tr '[:upper:]' '[:lower:]')
+
+    # Stop at any "Recommendation" / recap section the model might append
+    if [[ "$nocolor" == RECOMMENDATION:* ]] || \
+       [[ "$low" == *recommendation* && "$nocolor" == *▸* ]] || \
+       [[ "$low" == \#*recommendation* ]] || \
+       [[ "$low" == \#*summary* && "$nocolor" != SUMMARY:* ]]; then
+      skip_rec=1; continue
+    fi
+
+    # ── Code fences ──
+    if [[ "$t" == \`\`\`* ]]; then
+      tl=$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')
+      if [[ "$t" == '```' ]]; then
+        printf '    %s%s%s\n' "$DIM" '```' "$RST"
+        fence=""; continue
+      elif [[ "$tl" =~ ^\`\`\`ruby[[:space:]]+before$ || "$tl" == '```before' ]]; then
+        fence="before"
+        printf '\n    %s┄┄ before ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄%s\n' "$DIM" "$RST"
+        continue
+      elif [[ "$tl" =~ ^\`\`\`ruby[[:space:]]+(recommended|after)$ || "$tl" =~ ^\`\`\`(recommended|after)$ ]]; then
+        fence="recommended"
+        printf '    %s┄┄ recommended ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄%s\n' "$DIM" "$RST"
+        continue
+      else
+        fence="neutral"
+        printf '    %s%s%s\n' "$DIM" "$line" "$RST"
+        continue
+      fi
+    fi
+
+    # ── Inside fenced code ──
+    case "$fence" in
+      before)
+        printf '    %s  - %s%s\n' "$REDB" "$line" "$RST" ;;
+      recommended)
+        printf '    %s  + %s%s\n' "$GRNB" "$line" "$RST" ;;
+      neutral)
+        printf '    %s  %s%s\n' "$DIM" "$line" "$RST" ;;
+      *)
+        colorize_line "$line" ;;
+    esac
+  done <<< "$RAW"
+}
+
+# ── Coverage helper (optional external script) ──
+print_coverage() {
+  local rb gem_path
+  rb="$REPO_ROOT/scripts/git_analyze_staged_coverage.rb"
+  if [[ ! -f "$rb" ]]; then
+    gem_path=$(git config --get heimdalAiAnalyze.gemPath 2>/dev/null || true)
+    [[ -n "$gem_path" ]] && rb="$gem_path/lib/heimdal_ai_analyze/git_analyze_staged_coverage.rb"
+  fi
+  [[ ! -f "$rb" ]] && return 0
+  printf '\n' >&2
+  hr_title "STAGED NEW-CODE COVERAGE" >&2
+  rule >&2
+  printf '\n' >&2
+  ruby "$rb" "$REPO_ROOT" >&2 || true
+  printf '\n' >&2
+}
+
+# ── Main output ──
+{
+  printf '\n'
+  hr_title "FINDINGS"
+  rule
+  printf '\n'
+  render_findings
+  printf '\n'
+} >&2
+
+print_coverage
+
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │ Verdict                                                             │
+# └─────────────────────────────────────────────────────────────────────┘
+verdict_block() {
+  local icon=$1 label=$2 color=$3 msg=$4
+  printf '\n' >&2
+  hr_title "$label" >&2
+  printf '\n' >&2
+  printf '  %s%s  %s%s\n' "$color" "$icon" "$label" "$RST" >&2
+  [[ -n "$msg" ]] && printf '  %s%s%s\n' "$DIM" "$msg" "$RST" >&2
+  printf '\n' >&2
+  rule >&2
+  printf '\n' >&2
+}
+
+if printf '%s\n' "$RAW" | grep -Fq '[CRITICAL]'; then
+  verdict_block "✗" "COMMIT BLOCKED" "$REDB" \
+    "Resolve [CRITICAL] items above, or bypass: git commit --no-verify"
+  exit 1
+fi
+
+NONBLANK=$(printf '%s\n' "$RAW" | grep -c '[^[:space:]]' 2>/dev/null || true)
+if [[ "${NONBLANK:-0}" -eq 1 ]] && printf '%s\n' "$RAW" | grep -qFx 'NO_ISSUES_FOUND'; then
+  verdict_block "✓" "CLEAN — NO ISSUES" "$GRNB" ""
+  exit 0
+fi
+
+if printf '%s\n' "$RAW" | grep -qE '^(\*\*)?SUMMARY:'; then
+  verdict_block "✓" "COMMIT APPROVED" "$GRNB" \
+    "No CRITICAL findings. Bypass anytime: git commit --no-verify"
+  exit 0
+fi
+
+# Malformed output — fail closed
+{
+  printf '\n' >&2
+  hr_title "ERROR" >&2
+  printf '\n' >&2
+  printf '  %s✗  Malformed AI output. Failing closed.%s\n' "$REDB" "$RST" >&2
+  if printf '%s\n' "$RAW" | grep -Fq 'Workspace Trust Required'; then
+    printf '  %sCursor Agent blocked on workspace trust.%s\n' "$YEL" "$RST" >&2
+    printf '  %sRun once interactively: agent chat "hi"%s\n' "$DIM" "$RST" >&2
+  fi
+  printf '\n  %sRaw output (last 20 lines):%s\n' "$DIM" "$RST" >&2
+  printf '%s\n' "$RAW" | tail -20 | sed "s/^/  $DIM/" >&2
+  printf '%s\n' "$RST" >&2
+  rule >&2
+} >&2
+exit 1

@@ -1,0 +1,118 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# One-time per-repo: symlink pre-commit hook, set git analyze alias,
+# record gem path + Cursor Agent CLI path (local git config).
+
+require "fileutils"
+
+def gem_root
+  Gem::Specification.find_by_name("heimdal_ai_analyze").full_gem_path
+rescue Gem::MissingSpecError
+  File.expand_path("..", __dir__)
+end
+
+root = gem_root
+hook_src = File.join(root, "templates", "pre-commit")
+unless File.file?(hook_src)
+  warn "heimdal-ai-analyze-install: missing #{hook_src}"
+  exit 1
+end
+
+repo_root = `git rev-parse --show-toplevel 2>/dev/null`.strip
+if repo_root.empty?
+  warn "heimdal-ai-analyze-install: not inside a git repository"
+  exit 1
+end
+
+Dir.chdir(repo_root)
+
+git_common = `git rev-parse --git-common-dir 2>/dev/null`.strip
+if git_common.empty?
+  warn "heimdal-ai-analyze-install: could not resolve git dir"
+  exit 1
+end
+
+git_common_abs = File.expand_path(git_common, repo_root)
+hooks_dir = File.join(git_common_abs, "hooks")
+target = File.join(hooks_dir, "pre-commit")
+
+FileUtils.mkdir_p(hooks_dir)
+File.chmod(0o755, hook_src)
+FileUtils.ln_sf(hook_src, target)
+puts "Linked: #{target} -> #{hook_src}"
+
+unless system("git", "config", "alias.analyze", '!f() { ANALYZE=true git commit "$@"; }; f')
+  warn "heimdal-ai-analyze-install: failed to set git alias analyze"
+  exit 1
+end
+puts "Set git alias: analyze -> ANALYZE=true git commit (with \"$@\")"
+
+unless system("git", "config", "--local", "heimdalAiAnalyze.gemPath", root)
+  warn "heimdal-ai-analyze-install: failed to set heimdalAiAnalyze.gemPath"
+  exit 1
+end
+puts "Saved: git config --local heimdalAiAnalyze.gemPath"
+puts "  #{root}"
+
+def find_cursor_agent_bin
+  bin = ENV["CURSOR_AGENT_BIN"]
+  return bin if bin && !bin.empty? && File.executable?(bin)
+
+  %w[agent cursor-agent].each do |name|
+    path = `command -v #{name} 2>/dev/null`.strip
+    return path if !path.empty? && File.executable?(path)
+  end
+
+  base = File.join(Dir.home, ".local/share/cursor-agent/versions")
+  if File.directory?(base)
+    found = Dir.glob(File.join(base, "**", "cursor-agent")).select { |f| File.file?(f) }.max
+    return found if found && File.executable?(found)
+  end
+  nil
+end
+
+agent_bin = find_cursor_agent_bin
+if agent_bin
+  system("git", "config", "--local", "cursorHook.agentPath", agent_bin)
+  puts "Saved Cursor Agent path (local): git config cursorHook.agentPath"
+  puts "  #{agent_bin}"
+else
+  puts "Could not find Cursor Agent CLI (agent / cursor-agent)."
+  puts "  Install: curl https://cursor.com/install -fsSL | bash"
+  puts "  Add ~/.local/bin to PATH, then re-run this script."
+  if $stdin.tty? && $stdout.tty?
+    print "Enter full path to cursor-agent binary (empty to skip): "
+    manual = $stdin.gets
+    manual = manual&.strip
+    if manual && !manual.empty? && File.executable?(manual)
+      system("git", "config", "--local", "cursorHook.agentPath", manual)
+      puts "Saved: git config --local cursorHook.agentPath '#{manual}'"
+      agent_bin = manual
+    else
+      puts "Skipped. Set CURSOR_AGENT_BIN or git config --local cursorHook.agentPath, or use scripts/.env.hook"
+    end
+  else
+    puts "Non-interactive: set CURSOR_AGENT_BIN or git config cursorHook.agentPath after installing the CLI."
+  end
+end
+
+if agent_bin
+  puts ""
+  puts "Cursor Agent CLI probe:"
+  ok = system(agent_bin, "--help", out: $stdout, err: $stdout)
+  unless ok
+    system(agent_bin, "-h", out: $stdout, err: $stdout) || puts("  (could not read --help; binary: #{agent_bin})")
+  end
+end
+
+puts ""
+puts "Usage:"
+puts "  git analyze -m \"message\"   # AI pre-commit analysis, then commit if allowed"
+puts "  git commit -m \"message\"    # normal commit (hook skips analysis)"
+puts "  git commit --no-verify       # bypass hooks when needed"
+puts ""
+puts "Credentials: export CURSOR_API_KEY (see README; optional scripts/.env.hook or ~/.config/heimdal_ai_analyze/env)."
+puts "  CLI overview: https://cursor.com/docs/cli/overview"
+puts ""
+system("git config --local --unset claudeHook.cliPath 2>/dev/null")
