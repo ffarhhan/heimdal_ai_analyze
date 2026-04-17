@@ -8,6 +8,7 @@
 
 _Sees every line. Judges every commit. No bad code crosses the Bifrost._
 
+- **Owners:** [@ffarhhan](https://github.com/ffarhhan), [@namanverma98](https://github.com/namanverma98)
 - **RubyGems:** [rubygems.org/gems/heimdal_ai_analyze](https://rubygems.org/gems/heimdal_ai_analyze)
 - **Source:** [github.com/ffarhhan/heimdal_ai_analyze](https://github.com/ffarhhan/heimdal_ai_analyze)
 
